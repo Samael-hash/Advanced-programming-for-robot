@@ -1,0 +1,356 @@
+#include <stdio.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <semaphore.h>
+
+#define RCVBUFSIZE 10000
+#define MAX_ENTRIES 20
+#define MAX_NAME_LENGTH 50
+#define MAX_VALUE_LENGTH 50
+
+int sock;
+struct sockaddr_in echoServAddr;
+unsigned short echoServPort;
+char *servIP = "127.0.0.1";
+char *echoString = "connection working";
+char *echoScan = "scan data";
+char echoBuffer[RCVBUFSIZE];
+unsigned int echoStringLen;
+int bytesRcvd, totalBytesRcvd;
+
+int shmid;
+sem_t *sem;
+
+void DieWithError(char *errorMessage);
+
+void connection(int port) {
+    echoServPort = port;
+    if ((sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0)
+        DieWithError("socket() failed");
+
+    memset(&echoServAddr, 0, sizeof(echoServAddr));
+    echoServAddr.sin_family = AF_INET;
+    echoServAddr.sin_addr.s_addr = inet_addr(servIP);
+    echoServAddr.sin_port = htons(echoServPort);
+
+    if (connect(sock, (struct sockaddr *)&echoServAddr, sizeof(echoServAddr)) < 0)
+        DieWithError("connect() failed");
+}
+
+void message(char *argv) {
+    echoStringLen = strlen(argv);
+    if (send(sock, argv, echoStringLen, 0) != echoStringLen)
+        DieWithError("send() sent a different number of bytes than expected");
+}
+
+char *receive() {
+    char *receivedData = (char *)malloc(RCVBUFSIZE * sizeof(char));
+    if (receivedData == NULL) {
+        DieWithError("Memory allocation failed");
+    }
+
+    totalBytesRcvd = 0;
+    while (totalBytesRcvd < echoStringLen) {
+        if ((bytesRcvd = recv(sock, receivedData + totalBytesRcvd, RCVBUFSIZE - totalBytesRcvd - 1, 0)) <= 0) {
+            DieWithError("recv() failed or connection closed prematurely");
+        }
+        totalBytesRcvd += bytesRcvd;
+        receivedData[totalBytesRcvd] = '\0';
+    }
+
+    printf("%s\n", receivedData);
+    printf("\n");
+
+    return receivedData;
+}
+
+char *scan() {
+    connection(9997);
+    char *receivedData = receive();
+    return receivedData;
+}
+
+char *odom() {
+    connection(9998);
+    char *receivedData = receive();
+    return receivedData;
+}
+
+void cmd_vel(int linear, float angular) {
+    char command[100];
+    snprintf(command, sizeof(command), "---Start---{\"linear\":%d , \"angular\":%f}___END___", linear, angular);
+    message(command);
+}
+
+void filterLaserScanData(const char *message, char *dataNames[], char *dataValues[], int *numEntries) {
+    *numEntries = 0;
+    const char *ptr = message;
+
+    while (*ptr != '\0') {
+        const char *nameStart = strstr(ptr, "float32 ");
+        const char *valueStart = strstr(ptr, ": ");
+
+        if (nameStart != NULL && valueStart != NULL) {
+            nameStart += strlen("float32 ");
+
+            int nameLength = strcspn(nameStart, ":") + 1;
+            dataNames[*numEntries] = (char *)malloc((nameLength + 1) * sizeof(char));
+            strncpy(dataNames[*numEntries], nameStart, nameLength);
+            dataNames[*numEntries][nameLength - 1] = '\0';
+
+            valueStart += strlen(": ");
+
+            int valueLength = strcspn(valueStart, " ") + 1;
+            dataValues[*numEntries] = (char *)malloc((valueLength + 1) * sizeof(char));
+            strncpy(dataValues[*numEntries], valueStart, valueLength);
+            dataValues[*numEntries][valueLength - 1] = '\0';
+
+            (*numEntries)++;
+        }
+
+        ptr = strstr(ptr, "float32 ");
+        if (ptr != NULL) {
+            ptr += strlen("float32 ");
+        } else {
+            break;
+        }
+    }
+}
+
+void filterOdometryData(const char *message, char *dataNames[], char *dataValues[], int *numEntries) {
+    *numEntries = 0;
+    const char *ptr = message;
+
+    while (*ptr != '\0') {
+        const char *nameStart = strstr(ptr, ": ");
+        if (nameStart != NULL) {
+            nameStart += 2;
+
+            int nameLength = strcspn(nameStart, ":");
+            dataNames[*numEntries] = (char *)malloc((nameLength + 1) * sizeof(char));
+            strncpy(dataNames[*numEntries], nameStart, nameLength);
+            dataNames[*numEntries][nameLength] = '\0';
+
+            const char *valueStart = strchr(nameStart, '\n');
+            if (valueStart != NULL) {
+                valueStart += 1;
+
+                int valueLength = strcspn(valueStart, "\n");
+                dataValues[*numEntries] = (char *)malloc((valueLength + 1) * sizeof(char));
+                strncpy(dataValues[*numEntries], valueStart, valueLength);
+                dataValues[*numEntries][valueLength] = '\0';
+
+                (*numEntries)++;
+            }
+        }
+
+        ptr = strchr(ptr, '\n');
+        if (ptr != NULL) {
+            ptr += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+void filterData(const char *message, char *dataNames[], char *dataValues[], int *numEntries) {
+    *numEntries = 0;
+    const char *ptr = message;
+
+    while (*ptr != '\0') {
+        const char *nameEnd = strchr(ptr, ':');
+        const char *valueStart = NULL;
+
+        if (nameEnd != NULL) {
+            const char *nameStart = nameEnd;
+            while (nameStart > message && !isspace(*(nameStart - 1))) {
+                nameStart--;
+            }
+
+            valueStart = nameEnd + 1;
+            while (*valueStart != '\0' && isspace(*valueStart)) {
+                valueStart++;
+            }
+
+            const char *valueEnd = valueStart;
+            while (*valueEnd != '\0' && !isspace(*valueEnd) && *valueEnd != ':' && *valueEnd != ',') {
+                valueEnd++;
+            }
+
+            int nameLength = nameEnd - nameStart;
+            int valueLength = valueEnd - valueStart;
+
+            dataNames[*numEntries] = (char *)malloc((nameLength + 1) * sizeof(char));
+            strncpy(dataNames[*numEntries], nameStart, nameLength);
+            dataNames[*numEntries][nameLength] = '\0';
+
+            dataValues[*numEntries] = (char *)malloc((valueLength + 1) * sizeof(char));
+            strncpy(dataValues[*numEntries], valueStart, valueLength);
+            dataValues[*numEntries][valueLength] = '\0';
+
+            (*numEntries)++;
+        }
+
+        ptr = nameEnd;
+        if (ptr != NULL) {
+            ptr += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+void moveRobot_linear(double distance) {
+    double totalDistance = 0.0;
+    double speed = 1.0;
+
+    cmd_vel(speed, 0);
+    receive();
+
+    while (totalDistance < distance) {
+        usleep(100000); // Wait for 0.1 second
+
+        totalDistance += speed * 0.1;
+
+        if (totalDistance >= distance) {
+            cmd_vel(0, 0);
+            printf("Stop: ");
+            receive();
+            break;
+        }
+    }
+}
+
+void moveRobot_circular(double radius) {
+    double speed = 1.0;
+    double angularSpeed = speed / radius;
+
+    double circumference = 2.0 * 3.14159 * radius;
+
+    cmd_vel(speed, angularSpeed);
+    receive();
+
+    double distanceTravelled = 0.0;
+
+    while (distanceTravelled < circumference) {
+        usleep(100000); // Wait for 0.1 second
+
+        distanceTravelled += speed * 0.1;
+
+        if (distanceTravelled >= circumference) {
+            cmd_vel(0, 0);
+            printf("Stop: ");
+            receive();
+            break;
+        }
+    }
+}
+
+void move_path() {
+    connection(9999);
+
+    double dist;
+    printf("Enter linear distance: ");
+    scanf("%lf", &dist);
+
+    double rad;
+    printf("Enter the radius: ");
+    scanf("%lf", &rad);
+
+    moveRobot_linear(dist);
+    sleep(2);
+
+    moveRobot_circular(rad);
+    sleep(2);
+
+    moveRobot_linear(dist);
+}
+
+void createSharedMemory() {
+    key_t key = ftok("/tmp", 'S');
+    if (key == -1) {
+        DieWithError("ftok() failed");
+    }
+
+    shmid = shmget(key, sizeof(int), IPC_CREAT | 0666);
+    if (shmid == -1) {
+        DieWithError("shmget() failed");
+    }
+
+    sem = sem_open("/mysem", O_CREAT, 0666, 1);
+    if (sem == SEM_FAILED) {
+        DieWithError("sem_open() failed");
+    }
+}
+
+void detachSharedMemory() {
+    sem_close(sem);
+    shmctl(shmid, IPC_RMID, NULL);
+}
+
+void scna() {
+    createSharedMemory();
+
+    while (1) {
+        sem_wait(sem);
+        char *scanData = scan();
+        sem_post(sem);
+
+        int numEntries;
+        char *dataNames[MAX_ENTRIES];
+        char *dataValues[MAX_ENTRIES];
+        filterLaserScanData(scanData, dataNames, dataValues, &numEntries);
+
+        printf("Laser Scan Data:\n");
+        for (int i = 0; i < numEntries; i++) {
+            printf("%s: %s\n", dataNames[i], dataValues[i]);
+            free(dataNames[i]);
+            free(dataValues[i]);
+        }
+
+        sleep(1);
+    }
+
+    detachSharedMemory();
+}
+
+void odometry() {
+    createSharedMemory();
+
+    while (1) {
+        sem_wait(sem);
+        char *odomData = odom();
+        sem_post(sem);
+
+        int numEntries;
+        char *dataNames[MAX_ENTRIES];
+        char *dataValues[MAX_ENTRIES];
+        filterOdometryData(odomData, dataNames, dataValues, &numEntries);
+
+        printf("Odometry Data:\n");
+        for (int i = 0; i < numEntries; i++) {
+            printf("%s: %s\n", dataNames[i], dataValues[i]);
+            free(dataNames[i]);
+            free(dataValues[i]);
+        }
+
+        sleep(1);
+    }
+
+    detachSharedMemory();
+}
+
+int main() {
+    scna();
+    // odometry();  // Uncomment this line if you want to run the odometry listener
+
+    return 0;
+    close(sock);
+    exit(0);
+}
