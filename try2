@@ -1,0 +1,327 @@
+#include <stdio.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+#define RCVBUFSIZE 10000
+#define MAX_ENTRIES 20
+
+int sock;
+struct sockaddr_in echoServAddr;
+unsigned short echoServPort;
+char *servIP = "127.0.0.1";
+char *echoBuffer;
+unsigned int echoStringLen;
+int bytesRcvd, totalBytesRcvd;
+
+void DieWithError(char *errorMessage) {
+    perror(errorMessage);
+    exit(EXIT_FAILURE);
+}
+
+// Shared memory and semaphore keys
+#define SHM_KEY 9876
+#define SEM_KEY "/my_semaphore"  // Unique name for the semaphore
+
+// Structure for shared data
+struct SharedScanData {
+    char scanData[RCVBUFSIZE];
+    sem_t semaphore;
+};
+
+// Function to initialize shared memory and semaphore
+void initializeSharedMemory(struct SharedScanData **sharedScanData) {
+    int shmid = shmget(SHM_KEY, sizeof(struct SharedScanData), IPC_CREAT | 0666);
+    if (shmid == -1) {
+        DieWithError("shmget");
+    }
+
+    *sharedScanData = (struct SharedScanData *)shmat(shmid, NULL, 0);
+
+    // Initialize semaphore
+    if ((sem_open(SEM_KEY, O_CREAT | O_EXCL, S_IRWXU, 1) == SEM_FAILED)) {
+        DieWithError("sem_open");
+    }
+}
+
+// Function to clean up shared memory and semaphore
+void cleanupSharedMemory(struct SharedScanData *sharedScanData) {
+    // Close semaphore
+    sem_close(&sharedScanData->semaphore);
+
+    // Detach and remove shared memory
+    shmdt(sharedScanData);
+    shmctl(shmget(SHM_KEY, sizeof(struct SharedScanData), IPC_CREAT | 0666), IPC_RMID, NULL);
+}
+
+// Function to wait on the semaphore
+void waitSemaphore(struct SharedScanData *sharedScanData) {
+    if (sem_wait(&sharedScanData->semaphore) == -1) {
+        DieWithError("sem_wait");
+    }
+}
+
+// Function to signal the semaphore
+void signalSemaphore(struct SharedScanData *sharedScanData) {
+    if (sem_post(&sharedScanData->semaphore) == -1) {
+        DieWithError("sem_post");
+    }
+}
+
+// Function to send scan data to shared memory
+void sendScanData(struct SharedScanData *sharedScanData, const char *scanData) {
+    waitSemaphore(sharedScanData);
+    strncpy(sharedScanData->scanData, scanData, RCVBUFSIZE);
+    signalSemaphore(sharedScanData);
+}
+
+// Function to receive scan data from shared memory
+void receiveScanData(struct SharedScanData *sharedScanData, char *receivedScanData) {
+    waitSemaphore(sharedScanData);
+    strncpy(receivedScanData, sharedScanData->scanData, RCVBUFSIZE);
+    signalSemaphore(sharedScanData);
+}
+
+// Function to calculate the robot's position and orientation
+void calculateRobotPose(const char *odometryData, const char *scanData) {
+    // Extract relevant information from odometryData and scanData
+    // Perform calculations to determine the robot's pose
+
+    // Example: Printing the odometry and scan data for illustration
+    printf("Odometry Data: %s\n", odometryData);
+    printf("Scan Data: %s\n", scanData);
+
+    // Example: Calculating and printing the robot's pose
+    // This is where you would implement the actual calculations
+    double robotX = 0.0;
+    double robotY = 0.0;
+    double robotTheta = 0.0;
+
+    printf("Robot Pose - X: %.2f, Y: %.2f, Theta: %.2f degrees\n", robotX, robotY, robotTheta);
+}
+
+void connection(int port) {
+    echoServPort = port;
+    if ((sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0)
+        DieWithError("socket() failed");
+
+    memset(&echoServAddr, 0, sizeof(echoServAddr));
+    echoServAddr.sin_family = AF_INET;
+    echoServAddr.sin_addr.s_addr = inet_addr(servIP);
+    echoServAddr.sin_port = htons(echoServPort);
+
+    if (connect(sock, (struct sockaddr *)&echoServAddr, sizeof(echoServAddr)) < 0)
+        DieWithError("connect() failed");
+}
+
+void message(char *argv) {
+    echoStringLen = strlen(argv);
+    if (send(sock, argv, echoStringLen, 0) != echoStringLen)
+        DieWithError("send() sent a different number of bytes than expected");
+}
+
+void receive() {
+    totalBytesRcvd = 0;
+    while (totalBytesRcvd < echoStringLen) {
+        if ((bytesRcvd = recv(sock, echoBuffer, RCVBUFSIZE - 1, 0)) <= 0)
+            DieWithError("recv() failed or connection closed prematurely");
+        totalBytesRcvd += bytesRcvd;
+        echoBuffer[bytesRcvd] = '\0';
+        printf("%s", echoBuffer);
+    }
+
+    printf("\n");
+}
+
+void cmd_vel(int linear, int angular) {
+    char command[100];
+    snprintf(command, sizeof(command), "---Start---{\"linear\":%d , \"angular\":%d}___END___", linear, angular);
+    message(command);
+}
+
+void filterLaserScanData(const char *message, char *dataNames[], char *dataValues[], int *numEntries, struct SharedScanData *sharedScanData) {
+    connection(9997);
+    *numEntries = 0;
+
+    const char *ptr = message;
+
+    while (*ptr != '\0') {
+        const char *nameStart = strstr(ptr, "float32 ");
+        const char *valueStart = strstr(ptr, ": ");
+
+        if (nameStart != NULL && valueStart != NULL) {
+            nameStart += strlen("float32 ");
+
+            int nameLength = strcspn(nameStart, ":") + 1;
+            dataNames[*numEntries] = (char *)malloc((nameLength + 1) * sizeof(char));
+            strncpy(dataNames[*numEntries], nameStart, nameLength);
+            dataNames[*numEntries][nameLength - 1] = '\0';
+
+            valueStart += strlen(": ");
+
+            int valueLength = strcspn(valueStart, " ") + 1;
+            dataValues[*numEntries] = (char *)malloc((valueLength + 1) * sizeof(char));
+            strncpy(dataValues[*numEntries], valueStart, valueLength);
+            dataValues[*numEntries][valueLength - 1] = '\0';
+
+            (*numEntries)++;
+        }
+
+        ptr = strstr(ptr, "float32 ");
+        if (ptr != NULL) {
+            ptr += strlen("float32 ");
+        } else {
+            break;
+        }
+    }
+
+    // Send scan data to shared memory
+    sendScanData(sharedScanData, ptr);
+}
+
+void odomListener() {
+    connection(9998);
+
+    char odomData[RCVBUFSIZE];
+    memset(odomData, 0, RCVBUFSIZE);
+
+    if ((bytesRcvd = recv(sock, odomData, RCVBUFSIZE - 1, 0)) <= 0)
+        DieWithError("recv() failed or connection closed prematurely");
+
+    odomData[bytesRcvd] = '\0';
+    printf("Received Odom Data: %s\n", odomData);
+
+    close(sock);
+}
+
+void scanListener(struct SharedScanData *sharedScanData) {
+    connection(9997);
+
+    char scanData[RCVBUFSIZE];
+    memset(scanData, 0, RCVBUFSIZE);
+
+    if ((bytesRcvd = recv(sock, scanData, RCVBUFSIZE - 1, 0)) <= 0)
+        DieWithError("recv() failed or connection closed prematurely");
+
+    scanData[bytesRcvd] = '\0';
+    printf("Received Scan Data: %s\n", scanData);
+
+    // Send scan data to shared memory
+    sendScanData(sharedScanData, scanData);
+
+    close(sock);
+}
+
+void moveRobot_linear(double distance) {
+    connection(9999);
+
+    double totalDistance = 0.0;
+    double speed = 1.0;
+
+    cmd_vel(speed, 0);
+    receive();
+
+    while (totalDistance < distance) {
+        usleep(100000);
+
+        totalDistance += speed * 0.1;
+
+        if (totalDistance >= distance) {
+            cmd_vel(0, 0);
+            printf("Stop: ");
+            receive();
+            break;
+        }
+    }
+
+    close(sock);
+}
+
+// Function to move the robot on a given path with linear control
+void moveRobotOnPath(struct SharedScanData *sharedScanData) {
+    // Specify the path with distances to move linearly
+    double pathDistances[] = {1.0, 2.0, 1.5, 0.5};  // Example path
+
+    // Iterate through the path distances and move the robot
+    for (int i = 0; i < sizeof(pathDistances) / sizeof(pathDistances[0]); ++i) {
+        double distanceToMove = pathDistances[i];
+        moveRobot_linear(distanceToMove);
+
+        // After moving, update the received scan data
+        char receivedScanData[RCVBUFSIZE];
+        receiveScanData(sharedScanData, receivedScanData);
+
+        // Calculate robot pose using odometry and updated scan data
+        calculateRobotPose("ExampleOdometryData", receivedScanData);
+    }
+}
+
+int main() {
+    struct SharedScanData *sharedScanData;
+    echoBuffer = (char *)malloc(RCVBUFSIZE * sizeof(char));
+
+    // Initialize shared memory
+    initializeSharedMemory(&sharedScanData);
+
+    char message[] = "Each laser scan is a single scan line. The sensor_msgs/LaserScan message contains the following information: # Single scan from a planar laser range-finder Header header # stamp: The acquisition time of the first ray in the scan. # frame_id: The laser is assumed to spin around the positive Z axis # (counterclockwise, if Z is up) with the zero angle forward along the x axis float32 angle_min: -1.57 float32 angle_max: 1.57 float32 angle_increment: 0.0175 float32 time_increment: 0.001 float32 scan_time: 0.0333 float32 range_min: 0.0 float32 range_max: 100.0 float32[] ranges: [1.0, 2.5, 3.7, 5.2, 10.0] float32[] intensities: []";
+
+    char *dataNames[MAX_ENTRIES];
+    char *dataValues[MAX_ENTRIES];
+    int numEntries = 0;
+
+    for (int i = 0; i < MAX_ENTRIES; ++i) {
+        dataNames[i] = NULL;
+        dataValues[i] = NULL;
+    }
+
+    filterLaserScanData(message, dataNames, dataValues, &numEntries, sharedScanData);
+
+    for (int i = 0; i < numEntries; ++i) {
+        printf("Nom : %s | Valeur : %s\n", dataNames[i], dataValues[i]);
+        free(dataNames[i]);
+        free(dataValues[i]);
+    }
+
+    // Call odom listener
+    odomListener();
+
+    // Call scan listener
+    char receivedScanData[RCVBUFSIZE];
+    receiveScanData(sharedScanData, receivedScanData);
+
+    // Calculate robot pose using odometry and scan data
+    calculateRobotPose("ExampleOdometryData", receivedScanData);
+
+    // Move the robot on a given path
+    moveRobotOnPath(sharedScanData);
+
+    // Simulate a new task (replace this with actual task logic)
+    printf("Performing a task...\n");
+    // Example: Move the robot in a circular motion for demonstration
+    for (int i = 0; i < 10; ++i) {
+        cmd_vel(1, 1);  // Move linear and angular
+        receive();
+        usleep(500000);  // Sleep for 0.5 seconds
+    }
+    cmd_vel(0, 0);  // Stop the robot
+    receive();
+
+    // Continue moving the robot on the path
+    moveRobotOnPath(sharedScanData);
+
+    // Clean up shared memory
+    cleanupSharedMemory(sharedScanData);
+
+    // Free allocated memory
+    free(echoBuffer);
+
+    exit(0);
+}
