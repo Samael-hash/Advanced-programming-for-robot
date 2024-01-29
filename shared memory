@@ -1,0 +1,114 @@
+// Shared memory and semaphore keys
+#define SHM_KEY 9876
+#define SEM_KEY 8765
+
+// Structure for shared data
+struct SharedScanData {
+    char scanData[RCVBUFSIZE];
+    sem_t semaphore;
+};
+
+// Function to initialize shared memory and semaphore
+void initializeSharedMemory(struct SharedScanData **sharedScanData) {
+    int shmid = shmget(SHM_KEY, sizeof(struct SharedScanData), IPC_CREAT | 0666);
+    if (shmid == -1) {
+        perror("shmget");
+        exit(EXIT_FAILURE);
+    }
+
+    *sharedScanData = (struct SharedScanData *)shmat(shmid, NULL, 0);
+
+    // Initialize semaphore
+    if (sem_init(&(*sharedScanData)->semaphore, 1, 1) == -1) {
+        perror("sem_init");
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Function to clean up shared memory and semaphore
+void cleanupSharedMemory(struct SharedScanData *sharedScanData) {
+    // Destroy semaphore
+    sem_destroy(&sharedScanData->semaphore);
+
+    // Detach and remove shared memory
+    shmdt(sharedScanData);
+    shmctl(shmget(SHM_KEY, sizeof(struct SharedScanData), IPC_CREAT | 0666), IPC_RMID, NULL);
+}
+
+// Function to wait on the semaphore
+void waitSemaphore(struct SharedScanData *sharedScanData) {
+    if (sem_wait(&sharedScanData->semaphore) == -1) {
+        perror("sem_wait");
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Function to signal the semaphore
+void signalSemaphore(struct SharedScanData *sharedScanData) {
+    if (sem_post(&sharedScanData->semaphore) == -1) {
+        perror("sem_post");
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Function to send scan data to shared memory
+void sendScanData(struct SharedScanData *sharedScanData, const char *scanData) {
+    waitSemaphore(sharedScanData);
+    strncpy(sharedScanData->scanData, scanData, RCVBUFSIZE);
+    signalSemaphore(sharedScanData);
+}
+
+// Function to receive scan data from shared memory
+void receiveScanData(struct SharedScanData *sharedScanData, char *receivedScanData) {
+    waitSemaphore(sharedScanData);
+    strncpy(receivedScanData, sharedScanData->scanData, RCVBUFSIZE);
+    signalSemaphore(sharedScanData);
+}
+
+// Now here the shared memory implament into int main function 
+
+int main() {
+    struct SharedScanData *sharedScanData;
+    echoBuffer = (char *)malloc(RCVBUFSIZE * sizeof(char));
+
+    // Initialize shared memory
+    initializeSharedMemory(&sharedScanData);
+
+    // ... (rest of your code)
+
+    // Call odom listener
+    odomListener();
+
+    // Call scan listener
+    char receivedScanData[RCVBUFSIZE];
+    receiveScanData(sharedScanData, receivedScanData);
+
+    // Calculate robot pose using odometry and scan data
+    calculateRobotPose("ExampleOdometryData", receivedScanData);
+
+    // Move the robot on a given path
+    moveRobotOnPath(sharedScanData);
+
+    // Simulate a new task (replace this with actual task logic)
+    printf("Performing a task...\n");
+    // Example: Move the robot in a circular motion for demonstration
+    for (int i = 0; i < 10; ++i) {
+        cmd_vel(1, 1);  // Move linear and angular
+        receive();
+        usleep(500000);  // Sleep for 0.5 seconds
+    }
+    cmd_vel(0, 0);  // Stop the robot
+    receive();
+
+    // Continue moving the robot on the path
+    moveRobotOnPath(sharedScanData);
+
+    // Clean up shared memory
+    cleanupSharedMemory(sharedScanData);
+
+    // Free allocated memory
+    free(echoBuffer);
+
+    exit(0);
+}
+
